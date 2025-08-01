@@ -20,5 +20,5 @@ def test_tts_service(text):
         print(f"Error in TTS service: {tts_response.text}")
 
 # 测试文本
-test_text = "感谢你提供了详细的文档。根据这些信息，我们需要确保在调用文本转语音服务时传递正确的参数，并且路径格式正确。以下是更新后的验证代码，确保所有参数都符合API的要求。"
+test_text = "这是一次语音测试。"
 test_tts_service(test_text)
