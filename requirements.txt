@@ -1,0 +1,21 @@
+# 核心依赖
+gradio==4.32.0
+requests==2.32.3
+
+# 配置管理
+# onfigparser==7.0.0
+
+# 系统集成
+# webbrowser==0.2.1
+# pywin32==306  # Windows 专用，仅当在 Windows 上运行时需要
+
+# 语音处理（可选，用于高级音频处理）
+# pydub==0.25.1
+# soundfile==0.12.1
+
+# 性能优化
+# psutil==5.9.8
+# numpy==1.26.4
+
+# 开发工具（可选）
+# tqdm==4.66.4  # 进度条显示
