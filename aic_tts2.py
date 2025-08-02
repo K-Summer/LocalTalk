@@ -13,6 +13,12 @@ CONFIG_FILE = "config.ini"
 CONFIG = None
 FIRST_RUN = not os.path.exists(CONFIG_FILE)
 
+# 全局状态跟踪
+AUDIO_GENERATED = threading.Event()
+AUDIO_FILE_PATH = None
+TTS_ERROR = None
+TTS_ELAPSED = None  # 添加全局变量存储语音合成耗时
+
 
 def load_config():
     """加载配置文件"""
@@ -28,7 +34,7 @@ def load_config():
             "ollama_url": config.get("API", "ollama_url", fallback=""),
             "tts_url": config.get("API", "tts_url", fallback=""),
             "default_model": config.get(
-                "API", "default_model", fallback="monika:latest"
+                "API", "default_model", fallback="qwen2.5vl:latest"
             ),
         },
         "TTS": {
@@ -36,6 +42,7 @@ def load_config():
             "prompt_text": config.get("TTS", "prompt_text", fallback=""),
             "prompt_language": config.get("TTS", "prompt_language", fallback="zh"),
             "text_language": config.get("TTS", "text_language", fallback="zh"),
+            "enable_tts": config.get("TTS", "enable_tts", fallback="True"),
         },
     }
     return CONFIG
@@ -54,6 +61,7 @@ def save_config(config_data):
         "prompt_text": config_data["TTS"]["prompt_text"],
         "prompt_language": config_data["TTS"]["prompt_language"],
         "text_language": config_data["TTS"]["text_language"],
+        "enable_tts": config_data["TTS"]["enable_tts"],
     }
 
     with open(CONFIG_FILE, "w") as f:
@@ -101,7 +109,6 @@ def get_ollama_models():
         return [model["name"] for model in models_data.get("models", [])]
     except Exception as e:
         print(f"获取模型列表失败: {str(e)}")
-        # 返回默认模型列表
         return ["qwen2.5vl:latest", "llama3:latest", "mistral:latest"]
 
 
@@ -109,7 +116,6 @@ def generate_completion(prompt, model=None):
     if not CONFIG or not CONFIG["API"].get("ollama_url"):
         raise gr.Error("Ollama API地址未配置！请先完成配置")
 
-    # 如果没有指定模型，使用配置中的默认模型
     if not model:
         model = CONFIG["API"].get("default_model", "qwen2.5vl:latest")
 
@@ -170,7 +176,31 @@ def typewriter_effect(text, delay=0.03):
         time.sleep(delay)
 
 
+def generate_audio_in_thread(text):
+    """在后台线程中生成语音"""
+    global AUDIO_GENERATED, AUDIO_FILE_PATH, TTS_ERROR, TTS_ELAPSED
+
+    try:
+        audio_file, elapsed = tts_service(text)
+        AUDIO_FILE_PATH = audio_file
+        TTS_ELAPSED = f"{elapsed:.2f}秒"  # 存储语音合成耗时
+        AUDIO_GENERATED.set()
+        return audio_file, elapsed
+    except Exception as e:
+        TTS_ERROR = str(e)
+        AUDIO_GENERATED.set()
+        return None, str(e)
+
+
 def chat_with_monica(input_text, model):
+    global AUDIO_GENERATED, AUDIO_FILE_PATH, TTS_ERROR, TTS_ELAPSED
+
+    # 重置全局状态
+    AUDIO_GENERATED.clear()
+    AUDIO_FILE_PATH = None
+    TTS_ERROR = None
+    TTS_ELAPSED = None
+
     missing = check_config()
     if missing:
         raise gr.Error(f"配置不完整，无法聊天。缺少: {', '.join(missing)}")
@@ -184,15 +214,100 @@ def chat_with_monica(input_text, model):
 
     monica_response = f"LocalTalk（使用 {used_model}）：{completion}"
 
-    # 生成语音
-    audio_file, tts_elapsed = tts_service(completion)
-    time_log.append(f"{tts_elapsed:.2f}秒")
+    # 检查是否启用了语音生成
+    enable_tts = CONFIG["TTS"].get("enable_tts", "True").lower() == "true"
 
-    # 总耗时
+    if enable_tts:
+        # 启动后台线程生成语音
+        threading.Thread(
+            target=generate_audio_in_thread, args=(completion,), daemon=True
+        ).start()
+    else:
+        # 如果禁用了语音生成，直接设置完成状态
+        AUDIO_GENERATED.set()
+
+    # 总耗时（不包含语音生成时间）
     total_elapsed = time.time() - total_start
     time_log.append(f"{total_elapsed:.2f}秒")
 
-    return monica_response, audio_file, time_log
+    return monica_response, time_log
+
+
+def stream_response(monica_response, time_log, show):
+    """流式响应生成器，包含打字机效果和语音状态更新"""
+    global AUDIO_GENERATED, AUDIO_FILE_PATH, TTS_ERROR, TTS_ELAPSED
+
+    if monica_response is None:
+        yield "错误：未收到回复", gr.Audio(visible=False), "", "", ""
+        return
+
+    # 应用打字机效果
+    for partial_text in typewriter_effect(monica_response):
+        # 检查语音是否已生成
+        audio_status = ""
+        audio_visible = False
+
+        # 检查是否启用了语音生成
+        enable_tts = CONFIG["TTS"].get("enable_tts", "True").lower() == "true"
+
+        if enable_tts:
+            if AUDIO_GENERATED.is_set():
+                if AUDIO_FILE_PATH:
+                    audio_status = "🔊 语音就绪"
+                    audio_visible = True
+                elif TTS_ERROR:
+                    audio_status = f"❌ 语音生成失败: {TTS_ERROR}"
+            else:
+                audio_status = "⏳ 正在生成语音..."
+        else:
+            audio_status = "🔇 语音功能已禁用"
+
+        # 更新显示文本
+        display_text = f"{partial_text}\n\n{audio_status}"
+
+        # 创建音频组件
+        audio_component = gr.Audio(
+            value=AUDIO_FILE_PATH if AUDIO_FILE_PATH else None, visible=audio_visible
+        )
+
+        # 更新耗时显示
+        # 只有在语音合成完成时才显示耗时
+        tts_time_display = (
+            TTS_ELAPSED if AUDIO_GENERATED.is_set() and AUDIO_FILE_PATH else ""
+        )
+
+        time_display = (
+            (time_log[0], tts_time_display, time_log[1]) if show else ("", "", "")
+        )
+        yield display_text, audio_component, *time_display
+
+    # 最终显示状态
+    final_audio = gr.Audio(
+        value=AUDIO_FILE_PATH if AUDIO_FILE_PATH else None,
+        visible=AUDIO_GENERATED.is_set() and AUDIO_FILE_PATH and enable_tts,
+    )
+
+    # 如果有错误，显示错误信息
+    final_text = monica_response
+
+    # 检查是否启用了语音生成
+    if enable_tts:
+        if TTS_ERROR:
+            final_text += f"\n\n语音生成失败: {TTS_ERROR}"
+        elif AUDIO_GENERATED.is_set() and not AUDIO_FILE_PATH:
+            final_text += "\n\n语音生成失败: 未知错误"
+
+    # 更新耗时统计
+    # 只有在语音合成完成时才显示耗时
+    tts_time_display = (
+        TTS_ELAPSED if AUDIO_GENERATED.is_set() and AUDIO_FILE_PATH else ""
+    )
+
+    time_display = (
+        (time_log[0], tts_time_display, time_log[1]) if show else ("", "", "")
+    )
+
+    yield final_text, final_audio, *time_display
 
 
 def open_browser():
@@ -204,7 +319,7 @@ def open_browser():
 def create_config_wizard():
     """创建配置向导界面"""
     with gr.Blocks(title="配置向导") as wizard:
-        gr.Markdown("# 🧙‍♂️ 欢迎使用LocalTalk聊天助手配置向导")
+        gr.Markdown("# 🧙‍♂️ 欢迎使用LocalTalk配置向导")
         gr.Markdown("首次使用需要完成以下配置，请根据您的环境填写相应信息")
 
         with gr.Accordion("1. Ollama API 设置", open=True):
@@ -300,6 +415,13 @@ def create_config_wizard():
                     label="合成文本语言", choices=["zh", "en", "jp"], value="zh"
                 )
 
+            # 添加语音生成开关
+            enable_tts = gr.Checkbox(
+                label="启用语音生成功能",
+                value=True,
+                info="如果禁用此选项，聊天时将不会生成语音",
+            )
+
         # 配置验证和保存
         status = gr.Textbox(
             label="配置状态", interactive=False, value="请填写所有必要配置项"
@@ -307,7 +429,7 @@ def create_config_wizard():
         save_btn = gr.Button("✅ 保存配置并启动", variant="primary")
 
         def validate_and_save_config(
-            ollama, tts, ref_wav, p_text, p_lang, t_lang, d_model
+            ollama, tts, ref_wav, p_text, p_lang, t_lang, d_model, tts_enabled
         ):
             # 验证必要字段
             errors = []
@@ -335,13 +457,14 @@ def create_config_wizard():
                     "prompt_text": p_text,
                     "prompt_language": p_lang,
                     "text_language": t_lang,
+                    "enable_tts": str(tts_enabled),
                 },
             }
 
             if save_config(config_data):
                 return "✅ 配置保存成功！应用将在3秒后重启..."
             else:
-                return "❌ 配置保存失败，请检查文件权限"
+                return "❌ 配置保存失败"
 
         save_btn.click(
             validate_and_save_config,
@@ -353,6 +476,7 @@ def create_config_wizard():
                 prompt_lang,
                 text_lang,
                 default_model,
+                enable_tts,
             ],
             outputs=status,
         )
@@ -361,7 +485,6 @@ def create_config_wizard():
         def restart_application(status_msg):
             if status_msg.startswith("✅"):
                 time.sleep(3)
-                # 重启应用
                 os.execl(sys.executable, sys.executable, *sys.argv)
             return status_msg
 
@@ -372,11 +495,10 @@ def create_config_wizard():
 
 def create_chat_interface():
     """创建聊天界面"""
-    # 获取模型列表
-    model_list = get_ollama_models() if CONFIG else ["monika:latest"]
-    default_model = CONFIG["API"]["default_model"] if CONFIG else "monika:latest"
+    model_list = get_ollama_models() if CONFIG else ["qwen2.5vl:latest"]
+    default_model = CONFIG["API"]["default_model"] if CONFIG else "qwen2.5vl:latest"
 
-    with gr.Blocks(title="LocalTalk聊天助手") as chat_interface:
+    with gr.Blocks(title="LocalTalk") as chat_interface:
         # 显示配置状态
         config_status = gr.Markdown()
 
@@ -385,13 +507,15 @@ def create_chat_interface():
             if missing:
                 return f"⚠️ **聊天功能不可用**，缺少必要配置: {', '.join(missing)}\n请前往'配置'页面进行设置"
             else:
-                return "✅ **所有配置已设置**，可以开始聊天！"
+                enable_tts = CONFIG["TTS"].get("enable_tts", "True").lower() == "true"
+                tts_status = "启用" if enable_tts else "禁用"
+                return f"✅ **所有配置已设置**，可以开始聊天！\n语音功能: {tts_status}"
 
         config_status.value = update_config_status()
 
         gr.Markdown(
             """
-        # 💬 LocalTalk聊天助手
+        # 💬 开始聊天吧
         """
         )
 
@@ -416,7 +540,6 @@ def create_chat_interface():
                         "发送", variant="primary", interactive=not bool(check_config())
                     )
                     show_time = gr.Checkbox(label="显示耗时统计", value=True)
-                    refresh_models = gr.Button("🔄 刷新模型列表", size="sm")
 
             with gr.Column():
                 chat_output = gr.Textbox(
@@ -443,80 +566,45 @@ def create_chat_interface():
                         interactive=False,
                         elem_classes=["time-stats"],
                     )
-                    total_time = gr.Textbox(
-                        label="总耗时", interactive=False, elem_classes=["time-stats"]
-                    )
 
         # 用于存储中间状态
         full_response = gr.State()
-        audio_state = gr.State()
         time_state = gr.State()
 
         def toggle_time_visibility(show):
             return gr.Row.update(visible=show)
 
-        def refresh_model_list():
-            """刷新模型列表"""
-            new_models = get_ollama_models()
-            return gr.Dropdown.update(choices=new_models)
-
         def process_input(input_text, selected_model):
-            # 检查配置
             missing = check_config()
             if missing:
                 raise gr.Error(f"配置不完整，无法聊天。缺少: {', '.join(missing)}")
 
-            # 首先生成完整回复
-            monica_response, audio_file, time_log = chat_with_monica(
-                input_text, selected_model
-            )
-            return monica_response, audio_file, time_log, gr.Audio(visible=True)
-
-        def stream_response(monica_response, audio_file, time_log, show):
-            if monica_response is None:
-                yield "错误：未收到回复", gr.Audio(visible=False), "", "", ""
-                return
-
-            # 应用打字机效果
-            for partial_text in typewriter_effect(monica_response):
-                yield partial_text + "\n\n(正在输入...)", gr.Audio(
-                    visible=False
-                ), "", "", ""
-
-            # 最后显示完整内容
-            time_display = (
-                (time_log[0], time_log[1], time_log[2]) if show else ("", "", "")
-            )
-            yield monica_response, gr.Audio(
-                value=audio_file, visible=True
-            ), *time_display
+            monica_response, time_log = chat_with_monica(input_text, selected_model)
+            return monica_response, time_log
 
         # 显示/隐藏耗时统计
         show_time.change(fn=toggle_time_visibility, inputs=show_time, outputs=time_row)
-
-        # 刷新模型列表
-        refresh_models.click(fn=refresh_model_list, outputs=model_selector)
 
         # 设置按钮点击事件
         submit_btn.click(
             fn=process_input,
             inputs=[user_input, model_selector],
-            outputs=[full_response, audio_state, time_state, audio_output],
+            outputs=[full_response, time_state],
         ).then(
             fn=stream_response,
-            inputs=[full_response, audio_state, time_state, show_time],
-            outputs=[chat_output, audio_output, gen_time, tts_time, total_time],
+            inputs=[full_response, time_state, show_time],
+            outputs=[chat_output, audio_output, gen_time, tts_time],
         )
 
         # 设置回车键提交
         user_input.submit(
             fn=process_input,
             inputs=[user_input, model_selector],
-            outputs=[full_response, audio_state, time_state, audio_output],
+            outputs=[full_response, time_state],
         ).then(
             fn=stream_response,
-            inputs=[full_response, audio_state, time_state, show_time],
-            outputs=[chat_output, audio_output, gen_time, tts_time, total_time],
+            inputs=[full_response, time_state, show_time],
+            outputs=[chat_output, audio_output, gen_time, tts_time],
         )
 
     return chat_interface
@@ -563,11 +651,20 @@ def create_config_editor():
                         value=CONFIG["TTS"].get("text_language", "zh"),
                     )
 
+                # 添加语音生成开关
+                enable_tts = gr.Checkbox(
+                    label="启用语音生成功能",
+                    value=CONFIG["TTS"].get("enable_tts", "True").lower() == "true",
+                    info="如果禁用此选项，聊天时将不会生成语音",
+                )
+
         # 保存按钮
         save_btn = gr.Button("💾 保存配置", variant="primary")
         status = gr.Textbox(label="保存状态", interactive=False)
 
-        def save_current_config(ollama, tts, ref_wav, p_text, p_lang, t_lang, d_model):
+        def save_current_config(
+            ollama, tts, ref_wav, p_text, p_lang, t_lang, d_model, tts_enabled
+        ):
             config_data = {
                 "API": {"ollama_url": ollama, "tts_url": tts, "default_model": d_model},
                 "TTS": {
@@ -575,6 +672,7 @@ def create_config_editor():
                     "prompt_text": p_text,
                     "prompt_language": p_lang,
                     "text_language": t_lang,
+                    "enable_tts": str(tts_enabled),
                 },
             }
 
@@ -593,6 +691,7 @@ def create_config_editor():
                 prompt_lang,
                 text_lang,
                 default_model,
+                enable_tts,
             ],
             outputs=status,
         )
@@ -603,19 +702,23 @@ def create_config_editor():
 # 主应用
 with gr.Blocks(
     theme=gr.themes.Soft(),
-    css=".monica-chat {font-size: 16px !important} .time-stats {width: 100px !important}",
+    css="""
+    .monica-chat {font-size: 16px !important} 
+    .time-stats {width: 100px !important}
+    .monica-voice {max-height: 100px !important}
+    """,
 ) as main_app:
     # 加载配置
     config_loaded = load_config()
 
     # 根据是否首次运行显示不同界面
     if FIRST_RUN or not config_loaded or check_config():
-        gr.Markdown("# 🚀 欢迎使用LocalTalk聊天助手")
+        gr.Markdown("# 🚀 欢迎使用LocalTalk")
         with gr.Tabs():
             with gr.TabItem("初始配置", id="wizard"):
                 wizard = create_config_wizard()
     else:
-        gr.Markdown("# 💬 LocalTalk聊天助手")
+        gr.Markdown("# 💬 LocalTalk")
         with gr.Tabs():
             with gr.TabItem("聊天", id="chat"):
                 chat_interface = create_chat_interface()
