@@ -1,4 +1,5 @@
 import requests
+import re
 import gradio as gr
 import time
 import os
@@ -18,6 +19,18 @@ AUDIO_GENERATED = threading.Event()
 AUDIO_FILE_PATH = None
 TTS_ERROR = None
 TTS_ELAPSED = None  # 添加全局变量存储语音合成耗时
+AUDIO_READY = False
+
+
+def chat_with_monica(input_text, model):
+    global AUDIO_GENERATED, AUDIO_FILE_PATH, TTS_ERROR, TTS_ELAPSED, AUDIO_READY
+    
+    # 重置全局状态
+    AUDIO_GENERATED.clear()
+    AUDIO_FILE_PATH = None
+    TTS_ERROR = None
+    TTS_ELAPSED = None
+    AUDIO_READY = False  # 重置音频就绪状态
 
 
 def load_config():
@@ -128,7 +141,14 @@ def generate_completion(prompt, model=None):
         response = requests.post(url, headers=headers, json=data, timeout=30)
         response.raise_for_status()
         elapsed = time.time() - start_time
-        return response.json().get("response", ""), elapsed, model
+        
+        # 获取原始回复
+        raw_response = response.json().get("response", "")
+        
+        # 移除<think></think>标签及其内容
+        cleaned_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL)
+        
+        return cleaned_response, elapsed, model
     except Exception as e:
         raise gr.Error(f"生成回复时出错: {str(e)}")
 
@@ -154,7 +174,7 @@ def tts_service(text):
                 "text": text,
                 "text_language": CONFIG["TTS"]["text_language"],
             },
-            timeout=30,
+            timeout=30000,
         )
 
         response.raise_for_status()
@@ -210,10 +230,10 @@ def chat_with_monica(input_text, model):
 
     # 生成回复
     completion, gen_elapsed, used_model = generate_completion(input_text, model)
-    time_log.append(f"{gen_elapsed:.2f}秒")
-
+    # 这里确保移除了所有思考标签
     monica_response = f"LocalTalk（使用 {used_model}）：{completion}"
 
+    time_log.append(f"{gen_elapsed:.2f}秒")
     # 检查是否启用了语音生成
     enable_tts = CONFIG["TTS"].get("enable_tts", "True").lower() == "true"
 
@@ -235,18 +255,21 @@ def chat_with_monica(input_text, model):
 
 def stream_response(monica_response, time_log, show):
     """流式响应生成器，包含打字机效果和语音状态更新"""
-    global AUDIO_GENERATED, AUDIO_FILE_PATH, TTS_ERROR, TTS_ELAPSED
+    global AUDIO_GENERATED, AUDIO_FILE_PATH, TTS_ERROR, TTS_ELAPSED, AUDIO_READY
 
     if monica_response is None:
-        yield "错误：未收到回复", gr.Audio(visible=False), "", "", ""
+        yield "错误：未收到回复", "", ""
         return
 
+    # 初始化时间显示
+    gen_time_display = time_log[0] if show else ""
+    tts_time_display = ""
+    
     # 应用打字机效果
     for partial_text in typewriter_effect(monica_response):
         # 检查语音是否已生成
         audio_status = ""
-        audio_visible = False
-
+        
         # 检查是否启用了语音生成
         enable_tts = CONFIG["TTS"].get("enable_tts", "True").lower() == "true"
 
@@ -254,7 +277,11 @@ def stream_response(monica_response, time_log, show):
             if AUDIO_GENERATED.is_set():
                 if AUDIO_FILE_PATH:
                     audio_status = "🔊 语音就绪"
-                    audio_visible = True
+                    # 更新语音合成时间显示
+                    tts_time_display = TTS_ELAPSED if TTS_ELAPSED else ""
+                    # 只设置一次就绪状态
+                    if not AUDIO_READY:
+                        AUDIO_READY = True
                 elif TTS_ERROR:
                     audio_status = f"❌ 语音生成失败: {TTS_ERROR}"
             else:
@@ -264,30 +291,11 @@ def stream_response(monica_response, time_log, show):
 
         # 更新显示文本
         display_text = f"{partial_text}\n\n{audio_status}"
-
-        # 创建音频组件
-        audio_component = gr.Audio(
-            value=AUDIO_FILE_PATH if AUDIO_FILE_PATH else None, visible=audio_visible
-        )
-
-        # 更新耗时显示
-        # 只有在语音合成完成时才显示耗时
-        tts_time_display = (
-            TTS_ELAPSED if AUDIO_GENERATED.is_set() and AUDIO_FILE_PATH else ""
-        )
-
-        time_display = (
-            (time_log[0], tts_time_display, time_log[1]) if show else ("", "", "")
-        )
-        yield display_text, audio_component, *time_display
+        
+        # 只返回三个值：显示文本、文本生成耗时、语音合成耗时
+        yield display_text, gen_time_display, tts_time_display
 
     # 最终显示状态
-    final_audio = gr.Audio(
-        value=AUDIO_FILE_PATH if AUDIO_FILE_PATH else None,
-        visible=AUDIO_GENERATED.is_set() and AUDIO_FILE_PATH and enable_tts,
-    )
-
-    # 如果有错误，显示错误信息
     final_text = monica_response
 
     # 检查是否启用了语音生成
@@ -297,17 +305,20 @@ def stream_response(monica_response, time_log, show):
         elif AUDIO_GENERATED.is_set() and not AUDIO_FILE_PATH:
             final_text += "\n\n语音生成失败: 未知错误"
 
-    # 更新耗时统计
-    # 只有在语音合成完成时才显示耗时
-    tts_time_display = (
-        TTS_ELAPSED if AUDIO_GENERATED.is_set() and AUDIO_FILE_PATH else ""
-    )
+    # 确保语音合成时间已更新
+    if enable_tts and AUDIO_GENERATED.is_set() and AUDIO_FILE_PATH and TTS_ELAPSED:
+        tts_time_display = TTS_ELAPSED
+    
+    # 只返回三个值：最终文本、文本生成耗时、语音合成耗时
+    yield final_text, gen_time_display, tts_time_display
+    
 
-    time_display = (
-        (time_log[0], tts_time_display, time_log[1]) if show else ("", "", "")
-    )
-
-    yield final_text, final_audio, *time_display
+def get_audio_component():
+    """只在音频就绪时返回音频组件"""
+    global AUDIO_READY, AUDIO_FILE_PATH
+    if AUDIO_READY and AUDIO_FILE_PATH:
+        return gr.Audio(value=AUDIO_FILE_PATH, autoplay=True, visible=True)
+    return gr.Audio(visible=False)
 
 
 def open_browser():
@@ -555,17 +566,17 @@ def create_chat_interface():
                     elem_classes=["monica-voice"],
                 )
 
-                with gr.Row(visible=True) as time_row:
-                    gen_time = gr.Textbox(
-                        label="文本生成耗时",
-                        interactive=False,
-                        elem_classes=["time-stats"],
-                    )
-                    tts_time = gr.Textbox(
-                        label="语音合成耗时",
-                        interactive=False,
-                        elem_classes=["time-stats"],
-                    )
+            with gr.Row(visible=True) as time_row:
+                gen_time = gr.Textbox(
+                    label="文本生成耗时",
+                    interactive=False,
+                    elem_classes=["time-stats"],
+                )
+                tts_time = gr.Textbox(
+                    label="语音合成耗时",
+                    interactive=False,
+                    elem_classes=["time-stats"],
+                )
 
         # 用于存储中间状态
         full_response = gr.State()
@@ -593,7 +604,11 @@ def create_chat_interface():
         ).then(
             fn=stream_response,
             inputs=[full_response, time_state, show_time],
-            outputs=[chat_output, audio_output, gen_time, tts_time],
+            outputs=[chat_output, gen_time, tts_time],  # 现在只有3个输出
+        ).then(
+            fn=get_audio_component,  # 单独获取音频组件
+            inputs=[],
+            outputs=audio_output
         )
 
         # 设置回车键提交
@@ -604,7 +619,11 @@ def create_chat_interface():
         ).then(
             fn=stream_response,
             inputs=[full_response, time_state, show_time],
-            outputs=[chat_output, audio_output, gen_time, tts_time],
+            outputs=[chat_output, gen_time, tts_time],  # 现在只有3个输出
+        ).then(
+            fn=get_audio_component,  # 单独获取音频组件
+            inputs=[],
+            outputs=audio_output
         )
 
     return chat_interface
@@ -735,9 +754,6 @@ if __name__ == "__main__":
             except:
                 pass
 
-    # 在后台线程中打开浏览器
-    threading.Thread(target=open_browser, daemon=True).start()
-
     # 启动应用
     main_app.launch(
         server_name="0.0.0.0",
@@ -745,4 +761,5 @@ if __name__ == "__main__":
         share=False,
         inbrowser=False,
         show_error=True,
+        pwa=True,
     )
