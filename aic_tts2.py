@@ -6,7 +6,6 @@ import os
 import sys
 import configparser
 from datetime import datetime
-import webbrowser
 import threading
 
 # ======================
@@ -286,11 +285,6 @@ def get_audio_component():
 # ======================
 # 界面创建函数
 # ======================
-def open_browser():
-    """等待Gradio启动后打开浏览器"""
-    time.sleep(5)
-    webbrowser.open("http://localhost:9976")
-
 def create_config_wizard():
     """创建配置向导界面"""
     with gr.Blocks(title="配置向导") as wizard:
@@ -717,9 +711,6 @@ def launch_application():
                 with gr.TabItem("配置管理", id="config"):
                     config_editor = create_config_editor()
 
-    # 启动线程打开浏览器
-    threading.Thread(target=open_browser, daemon=True).start()
-    
     # 启动应用
     main_app.launch(
         server_name="0.0.0.0",
